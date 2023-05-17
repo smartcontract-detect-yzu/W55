@@ -1,0 +1,72 @@
+The attacker would place the first transaction that invokes  
+MoneyMarket.supply ( asset = imBTCAddress, amount = 9).
+At this point, the attacker holds a supply of 9 imBTC in the MoneyMarket contract, and a balance of 1 imBTC in the imBTC token contract.
+
+The attacker would place the second transaction that invokes 
+MoneyMarket.supply(asset = imBTCAddress, amount = 1) , 
+but now with an external call to MoneyMarket.withdraw(asset = imBTCAddress, requestedAmount = 9) inside the attackerContract.tokensToSend() callback.
+
+
+By the end of this transaction, the attacker’s imBTC balance in the imBTC token contract is 9, but the imBTC supply in the MoneyMarket contract is 10! 
+
+This unwanted state occurred as the  MoneyMarket.supply() function increases the supply for the attacker (lines 1599–1600) it uses stale data.
+Therefore, the function doesn’t “know” at this point, that the attacker has already withdrawn some of his supply.Now, the attacker holds a deposit on the MoneyMarket contract, backed by nothing.
+The attacker can use this to (falsely) borrow or withdraw assets deposited by other users. Furthermore, these two steps could be potentially performed, again and again, thus draining MoneyMarket’s liquidity.
+
+
+真实的漏洞是跨函数
+MoneyMarket.supply --> MoneyMarket.withdraw
+
+
+误报：MoneyMarket.supply的交易是转入行为，是将现金转入到当前合约中，攻击者又不是冤大头
+Reentrancy in MoneyMarket.supply(address,uint256) (MoneyMarket.sol#1508-1605):
+        External calls:
+        - err = checkTransferIn(asset,msg.sender,amount) (MoneyMarket.sol#1526)
+                - token.allowance(from,address(this)) < amount (MoneyMarket.sol#380)
+                - token.balanceOf(from) < amount (MoneyMarket.sol#384)
+        - localResults.currentCash = getCash(asset) (MoneyMarket.sol#1554)
+                - token.balanceOf(address(this)) (MoneyMarket.sol#434)
+        - (rateCalculationResultCode,localResults.newSupplyRateMantissa) = market.interestRateModel.getSupplyRate(asset,localResults.updatedCash,market.totalBorrows) (MoneyMarket.sol#1562)
+        - (rateCalculationResultCode,localResults.newBorrowRateMantissa) = market.interestRateModel.getBorrowRate(asset,localResults.updatedCash,market.totalBorrows) (MoneyMarket.sol#1573)
+        - err = doTransferIn(asset,msg.sender,amount) (MoneyMarket.sol#1583)
+                - token.transferFrom(from,address(this),amount) (MoneyMarket.sol#405)
+        State variables written after the call(s):
+        - market.blockNumber = getBlockNumber() (MoneyMarket.sol#1590)
+        - market.totalSupply = localResults.newTotalSupply (MoneyMarket.sol#1591)
+        - market.supplyRateMantissa = localResults.newSupplyRateMantissa (MoneyMarket.sol#1592)
+        - market.supplyIndex = localResults.newSupplyIndex (MoneyMarket.sol#1593)
+        - market.borrowRateMantissa = localResults.newBorrowRateMantissa (MoneyMarket.sol#1594)
+        - market.borrowIndex = localResults.newBorrowIndex (MoneyMarket.sol#1595)
+        - balance.principal = localResults.userSupplyUpdated (MoneyMarket.sol#1599)
+        - balance.interestIndex = localResults.newSupplyIndex (MoneyMarket.sol#1600)
+		
+
+
+误报：因为这个全局变量的修改不会影响本函数内部的交易
+err = doTransferOut(asset, msg.sender, localResults.withdrawAmount);
+  -- localResults.withdrawAmount 只和入参有关系
+
+Reentrancy in MoneyMarket.withdraw(address,uint256) (MoneyMarket.sol#1634-1761):
+        External calls:
+        - (err,localResults.accountLiquidity,localResults.accountShortfall) = calculateAccountLiquidity(msg.sender) (MoneyMarket.sol#1647)
+                - priceMantissa = oracleInterface.assetPrices(asset) (MoneyMarket.sol#1057)
+        - (err,localResults.withdrawCapacity) = getAssetAmountForValue(asset,localResults.accountLiquidity) (MoneyMarket.sol#1665)
+                - priceMantissa = oracleInterface.assetPrices(asset) (MoneyMarket.sol#1057)
+        - localResults.currentCash = getCash(asset) (MoneyMarket.sol#1678)
+                - token.balanceOf(address(this)) (MoneyMarket.sol#434)
+        - (err,localResults.ethValueOfWithdrawal) = getPriceForAssetAmount(asset,localResults.withdrawAmount) (MoneyMarket.sol#1699)
+                - priceMantissa = oracleInterface.assetPrices(asset) (MoneyMarket.sol#1057)
+        - (rateCalculationResultCode,localResults.newSupplyRateMantissa) = market.interestRateModel.getSupplyRate(asset,localResults.updatedCash,market.totalBorrows) (MoneyMarket.sol#1718)
+        - (rateCalculationResultCode,localResults.newBorrowRateMantissa) = market.interestRateModel.getBorrowRate(asset,localResults.updatedCash,market.totalBorrows) (MoneyMarket.sol#1729)
+        - err = doTransferOut(asset,msg.sender,localResults.withdrawAmount) (MoneyMarket.sol#1739)
+                - token.transfer(to,amount) (MoneyMarket.sol#460)
+        State variables written after the call(s):
+        - market.blockNumber = getBlockNumber() (MoneyMarket.sol#1746)
+        - market.totalSupply = localResults.newTotalSupply (MoneyMarket.sol#1747)
+        - market.supplyRateMantissa = localResults.newSupplyRateMantissa (MoneyMarket.sol#1748)
+        - market.supplyIndex = localResults.newSupplyIndex (MoneyMarket.sol#1749)
+        - market.borrowRateMantissa = localResults.newBorrowRateMantissa (MoneyMarket.sol#1750)
+        - market.borrowIndex = localResults.newBorrowIndex (MoneyMarket.sol#1751)
+        - supplyBalance.principal = localResults.userSupplyUpdated (MoneyMarket.sol#1755)
+        - supplyBalance.interestIndex = localResults.newSupplyIndex (MoneyMarket.sol#1756)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy-vulnerabilities-1
