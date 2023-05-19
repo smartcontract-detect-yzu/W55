@@ -9,6 +9,7 @@ from slither.core.declarations.function import Function as SFunction
 from slither.core.declarations import Contract as SContract
 from slither.core.cfg.node import Node, NodeType
 import re
+from slither.core.declarations.solidity_variables import SolidityFunction
 
 def argParse():
     parser = argparse.ArgumentParser(description='manual to this script')
@@ -16,14 +17,12 @@ def argParse():
     args = parser.parse_args()
     return args.id
 
-
-
 if __name__ == '__main__':
 
-    id = argParse()
-    if id < 0: raise RuntimeError("请输入正确的ID")
+    _id = argParse()
+    if _id < 0: raise RuntimeError("请输入正确的ID")
         
-    target_dir = "dataset/00{}".format(str(id)) if id < 10 else "dataset/0{}".format(str(id))
+    target_dir = "dataset/00{}".format(str(_id)) if _id < 10 else "dataset/0{}".format(str(_id))
     if not os.path.exists(target_dir):
         raise RuntimeError("输入的ID不存在")
     
@@ -43,62 +42,66 @@ if __name__ == '__main__':
     # 开始分析具体函数
     for target_id in contract_info.target_functions:
 
-        # 获得目标函数：external public
+        #* 获得目标函数：external public
         target_contract = contract_info.target_functions[target_id]['c']
         target_function:SFunction = contract_info.target_functions[target_id]['f']
         slither_core    = contract_info.target_functions[target_id]['s']
 
-        rich_console.rule(target_function.full_name + "   " + target_function.visibility)  
-
-        # 开始分析
+        #* 开始分析
+        if( _id == 999 and target_function.name != "deposit"): continue
+        rich_console.rule(f"分析對象：{target_function.full_name} VISIBILITY: {target_function.visibility}")  
+        
+        #* 分析器初始化
         function_analyzer = semantic_analyzer.get_function_analyzer(target_function)
         if function_analyzer is None:
             function_analyzer = FunctionAnalyzer(target_function, target_contract, slither_core, call_graph, target_dir)
             semantic_analyzer.add_function_analyzer(function_analyzer)
         
-        function_analyzer.analyze_function_with_interaction() # 代码所有语句，判断当前合约是否可以re-enter
+        #* 分析函数所有语句，判断当前函数是否有interaction操作
+        function_analyzer.analyze_function_with_interaction(True) 
         if function_analyzer.can_interaction():
             
-            function_analyzer.analyze_function_initialize()          # 初始化，包括获得cfg
-            _dir = function_analyzer.analyze_interaction_direction() # TODO：暫時規避
-            print(f"當前函數的交易方向為：{_dir}")
+            #* 获得CFG，每条语句的变量使用情况
+            function_analyzer.analyze_function_initialize()         
 
-            effect_svar = set()
-            function_analyzer.get_all_stmts_after_interaction()  #* 得到interaction之后执行的所有语句列表
-            re_pattern, _for_inter_funs = function_analyzer.analyze_effect_after_interaction_intraprocedural_analysis() # 寻找在interact之后修改的全局变量
-            contract_info.add_interaction_function(target_function, function_analyzer, _dir, re_pattern) # 记录
+            # TODO：判断当前函数有没有可以被利用的interact操作：transfer out/mint
+            risky_interaction_type = function_analyzer.analyze_interaction_financial_risky() 
+            
+            #* （过程内）分析函数内 effect after interaction 变量集合
+            function_analyzer.get_all_stmts_after_interaction()  
+            re_pattern, wait_inter_analyze = function_analyzer.analyze_effect_after_interaction_intraprocedural_analysis(True) # 寻找在interact之后修改的全局变量
+            contract_info.add_interaction_function(target_function, function_analyzer, risky_interaction_type, re_pattern) # 记录
+            print(f"當前函數的交易类型 -> {risky_interaction_type} re_pattern_flag:{re_pattern}")
+            
+            #TODO: 過程间分析 --> 得到過程间修改的全局變量
 
-            #! 针对mint函数需要进行函数间分析
-            inter_svar_effect = set()
-            for (called_contract, called_function) in _for_inter_funs:
-                called_function_analyzer = semantic_analyzer.get_function_analyzer(called_function)
-                if called_function_analyzer is None:
-                    called_function_analyzer = FunctionAnalyzer(called_function, called_contract, slither_core, call_graph, target_dir)
-                    semantic_analyzer.add_function_analyzer(called_function_analyzer)
-                _inter_svar_effect = called_function_analyzer.get_all_written_state_variabels()
-                print("INTER SVAR WRITE @ {}-{} {}".format(called_function.name, called_contract.name, [v.name for v in _inter_svar_effect]))
-                inter_svar_effect.union(inter_svar_effect)
-
-            if _dir == "out":
-
+            if risky_interaction_type in ["out", "mint"]:
+                print("\t->當前函數的危险interaction类型为: ", risky_interaction_type)
+                
                 for interaction_point in function_analyzer.interaction_points:
 
-                     #* 判斷interaction依賴的變量
-                    (r, d_r)  = semantic_analyzer.analyze_data_dependency(target_function, interaction_point) #!!必須先分析data dependency, 再分析ppt
+                    #* 判斷interaction依賴的變量
+                    semantic_analyzer.analyze_data_dependecy_with_intraprocedural(target_function, interaction_point, False) #!!必須先分析data dependency, 再分析ppt
 
                     #* 判斷執行路徑是否可衝入，有無path protect technology的保護 
                     (ppt, info) = semantic_analyzer.analyze_path_protection_technology(target_function, interaction_point)
 
-                    #* 一個轉賬出去的操作，且沒有ppt，表示這個函數是值得攻擊者重入的
-                    if not ppt: contract_info.add_canreenter_transferout_function(target_function) # 记录
+                    #* 记录当前函数为 reenter risky function
+                    if not ppt: contract_info.add_reenter_risky_function(target_function) # 记录
 
-
+    
+    rich_console.rule("开始污点分析")
     print("污點分析入口：",  [contract_info.interaction_functions[fid]['f'].name for fid in contract_info.interaction_functions])
-    print("污點分析sink: ", [contract_info.canreenter_transferout_functions[fid].name for fid in contract_info.canreenter_transferout_functions])
-
+    print("污點分析sink: ", [contract_info.reenter_risky_functions[fid].name for fid in contract_info.reenter_risky_functions])
+    
+    reentry_detect_result = []
     #* 基於污點分析的 interaction_function --> canreenter_transferout_function
     for interaction_fid in contract_info.interaction_functions:
 
+        print("\t - > 當前的source 為: {} {}".format(
+            contract_info.interaction_functions[interaction_fid]["f"].name,
+            contract_info.interaction_functions[interaction_fid]["re_pattern"]
+        ))
         interaction_finfo = contract_info.interaction_functions[interaction_fid]
         if not interaction_finfo["re_pattern"]: continue #* re_pattern 既 effect after interaction
 
@@ -111,88 +114,54 @@ if __name__ == '__main__':
         for interact_stmtid in tainted_sources_info:
             tainted_sources += tainted_sources_info[interact_stmtid]
         tainted_sources = set(tainted_sources)
+        
+        # TODO: 隱含的餘額修改，目前簡單的使用字符串表示
+        #! 隱藏的effect -> 修改了balance
         print("污点源列表: ", [v.name for v in tainted_sources], "for FUNC: ", interaction_func.name)
 
-        for canre_func_id in contract_info.canreenter_transferout_functions:
+        
+        for risky_func_id in contract_info.reenter_risky_functions:
             
             _next = False
 
-            #* 分析是否可以进行re interaction_func -> can_re_func
-            can_re_func = contract_info.canreenter_transferout_functions[canre_func_id]
-            can_re_func_analyzer = semantic_analyzer.get_function_analyzer(can_re_func)
-            print("開始進行污點分析 from: {} to:{}".format(interaction_func.name, can_re_func.name))
+            #* 分析是否可以进行重入攻擊 interaction_func -> risky_func
+            risky_func = contract_info.reenter_risky_functions[risky_func_id]
+            risky_func_analyzer = semantic_analyzer.get_function_analyzer(risky_func)
+            print("開始進行污點分析 from: {} to:{}".format(interaction_func.name, risky_func.name))
 
             #*  self.interaction_points[str(stmt.node_id)] = {"stmt":stmt, "to_c":c, "to_f":f }
-            for interaction_point_id in can_re_func_analyzer.interaction_points:
-                interaction_point:Node = can_re_func_analyzer.interaction_points[interaction_point_id]["stmt"]
-                _to_tainted_sinks = can_re_func_analyzer.interaction_points[interaction_point_id]["data_dependeds"]
+            for interaction_point_id in risky_func_analyzer.interaction_points:
+                interaction_point:Node = risky_func_analyzer.interaction_points[interaction_point_id]["stmt"]
+                _to_tainted_sinks = risky_func_analyzer.interaction_points[interaction_point_id]["data_dependeds"]
 
                 for source in tainted_sources:
                     if source in _to_tainted_sinks:
-                        print("存在重入攻擊 {} -> {}".format(interaction_func.name, can_re_func.name))
+                        
+                        ret_info = "存在重入攻擊 {} -> {}".format(interaction_func.name, risky_func.name)
+                        reentry_detect_result.append(ret_info)
                         _next = True
+                        
+                        print(ret_info)
                         break
                 
+                #TODO: 一旦risky操作被依赖于balance且前面有transfer，则被认为可能被重入
+                __to_tainted_sinks_balances = risky_func_analyzer.interaction_points[interaction_point_id]["balance_dependeds"]
+                if len(__to_tainted_sinks_balances) > 0 :
+                    
+                    ret_info = "BALANCE: 存在重入攻擊 {} -> {}".format(interaction_func.name, risky_func.name)
+                    reentry_detect_result.append(ret_info)
+                    _next = True
+                    
+                    print(ret_info)
+                    break
+
+                
                 if _next: break #* 結束當前函數，進入下一個函數
-                        
-                
-
-
-
-
-
-            # call_stack = function_analyzer.get_call_stack() # entry -> bottom_transfer_operation
-            # semantic_analyzer.prepare_for_analyze(call_stack[:-1], target_dir) # 判断分析当前函数所依赖的其它函数是否都创建了分析器
+        
+    print("重入漏洞检测结果: ") 
+    for info in reentry_detect_result:        
+        print("-> ", info)
             
-            # # 逐層分析，判斷交易方向 存/取
-            # call_chain = function_analyzer.get_interaction_call_chain()
-            # for idx, _call_relation in enumerate(reversed(call_chain)):
-                
-            #     print("調用關係: ", _call_relation["description"])
-
-            #     # 调用者信息
-            #     callee_function :SFunction = _call_relation["callee_function"]
-            #     callee_contract :SContract = _call_relation["callee_contract"]
-
-            #     # 调用者调用被调用者的语句
-            #     call_at_stmt :Node = _call_relation["at_stmt"]
-
-            #     # 被调用者信息
-            #     called_function :SFunction = _call_relation["called_function"]
-            #     called_contract :SContract = _call_relation["called_contract"]
-
-            #     if idx == 0:
-            #         if called_function.full_name == "transfer(address,uint256)":
-            #             first_param_name = str(call_at_stmt.expression).split("transfer(")[1].split(",")[0]
-            #             print("EXP: {}, PARAM_F: {}".format(call_at_stmt.expression, first_param_name))
-                        
-            #             for v in call_at_stmt.variables_read:
-            #                 if v.name == first_param_name:
-            #                     (flag, v, param_idx) = semantic_analyzer.analyze_data_dependency(callee_function, call_at_stmt, v)
-            #                     if flag == "withdraw":
-            #                          pass
-            #                     else:
-            #                         break
-            #     else:
-            #         print("一键三连")
-            #         print(call_at_stmt.expression)
-            #         print(called_function.name)
-            #         print(param_idx)
-            #         str(call_at_stmt.expression).split(called_function.name + "(")[0]
-            #         params = re.findall(re.compile(called_function.name + "\((\S*)\)"), str(call_at_stmt.expression))
-            #         param_lists = str(params).split(",")
-            #         for var in call_at_stmt.variables_read:
-            #             if var.name == param_lists[param_idx-1]:
-            #                 print("EXP: {}, PARAM_F: {} @ FUN:{}".format(call_at_stmt.expression, var.name, callee_function.name))
-            #                 (flag, v, param_idx) = semantic_analyzer.analyze_data_dependency(callee_function, call_at_stmt, var)
-            #                 if flag == "withdraw":
-            #                     pass
-            #                 else:
-            #                     break
-
-            #         pass
-
-                
 
 
 

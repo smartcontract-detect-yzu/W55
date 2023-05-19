@@ -32,15 +32,15 @@ class ContractInfoCollector:
         self.construct_functions:list[SFunction] = []
         self.target_functions = {} # 目标函数：external或者public
         self.interaction_functions = {} # 存在交易行爲的函數
-        self.canreenter_transferout_functions :Dict[str, SFunction] = {}
+        self.reenter_risky_functions :Dict[str, SFunction] = {} #* 危險的重入點
 
         if not os.path.exists(self.target_dir + "/log"): os.mkdir(self.target_dir + "/log")
     
     def add_interaction_function(self, f:SFunction, fanalyzer: FunctionAnalyzer, interact_dir:str, re_pattern:bool):
         self.interaction_functions[str(f.id)] = {"f": f, "a": fanalyzer, "d":interact_dir, "re_pattern":re_pattern}
 
-    def add_canreenter_transferout_function(self, f:SFunction):
-        self.canreenter_transferout_functions[str(f.id)] = f
+    def add_reenter_risky_function(self, f:SFunction):
+        self.reenter_risky_functions[str(f.id)] = f
 
     def get_sol_ver(self):
 
