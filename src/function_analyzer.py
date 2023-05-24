@@ -7,15 +7,22 @@ from slither.core.declarations.function import Function as SFunction
 from slither.core.declarations import Contract as SContract
 from slither.core.declarations import SolidityVariable
 from slither.core.variables.variable import Variable as SVariable
+from slither.core.variables import StateVariable
 from slither.core.cfg.node import Node, NodeType
 from slither.detectors.reentrancy.reentrancy import AbstractState
 from slither.analyses.data_dependency import data_dependency
 from rich.console import Console
 import networkx  as nx
 import networkx.drawing.nx_pydot as nx_dot
+from slither.core.expressions import AssignmentOperationType, AssignmentOperation, Identifier
+from slither.slithir.operations import Delete
+
+#* e.g., address(interestRateModel).call(abi.encodeWithSignature(checkpointInterest(uint256),borrowRateMantissa))
+from slither.core.expressions.call_expression import CallExpression as SCallExpression 
+            
 
 ALL_CONTEXT_INFO = ["send_eth", "calls", "reads", "written", "reads_prior_calls"]
-Variable_types = Union[SVariable, SolidityVariable]
+Variable_types = Union[SVariable, SolidityVariable, StateVariable]
 KEY_NON_SSA = "DATA_DEPENDENCY"
 INTERACT_BOTTOM_API = {
     "transfer(address,uint256)",
@@ -23,8 +30,11 @@ INTERACT_BOTTOM_API = {
 }
 
 RE_INTERACTION = "re"
+LLC_INTERACTION = "low-level call"
 MINT_INTERACTION = "mint"
 NORMAL_INTERACTION = "normal"
+
+HIJACKED_INTERACTIONS = ["re", "low-level call"]
 
 def _recheck_vars_in_expression(stmt_expression, vars):
     """
@@ -52,11 +62,16 @@ def _recheck_vars_in_expression(stmt_expression, vars):
     return ret_vars
 
 class FunctionAnalyzer:
-    def __init__(self, function:SFunction, contract:SContract, slither_core:Slither, call_graph:nx.DiGraph, target_dir) -> None:
+    def __init__(self, contract:SContract, function:SFunction, slither_core:Slither, call_graph:nx.DiGraph, target_dir) -> None:
         
-        # 唯一標識符
+        #* 唯一標識符
+        self.key = f'{str(contract.id)}-{str(function.id)}'
+        self.contract_id = str(contract.id)
         self.function_id = str(function.id)
-
+        self.full_name = f"{contract.name}-{function.name}"
+        self.name = f"{function.name}"
+        self.call_graph :nx.DiGraph = call_graph
+        
         # 核心数据结构，各分析器之间共享
         self.slither_core = slither_core
 
@@ -66,33 +81,54 @@ class FunctionAnalyzer:
         self.target_dir = target_dir
         self.target_log_dir = f"{target_dir}//log"
 
+        # 開關
         self.context_key = "REENTRANCY"
         self.init = False    
 
         # 打印日志相关
         self.rich_console = Console()
-        self.display_stmt_call_info_flag = True
+        self.display_stmt_call_info_flag = False
         self.display_stmt_var_info_flag = False
-        self.display_stmt_context_flag = False
-
-        self.stmt_map = {} #
+        self.display_stmt_context_flag = True
+        
+        # 函數相關
+        self.re_modifier = 0
+        self.ppt = 0    # path protect technology
+        self.hijacked = None
+        self.financial_risk = None
+        self.financial_risk_type = None
+        self.cfg = None # 当前函数的CFG
+        
+        # 語句相關
+        self.stmt_map:Dict[str, Node] = {} #
         self.stmts_var_infos = {}
         self.stmts_call_infos:Dict[str, set] = {}
         self.stmts_after_interaction = {}
-        self.interaction_points = {} # 可以被劫持的位置
-        self.interaction_point_call_chains = {} # 过程间分析
-        self.interaction_out_stmts = {} # 转账出去的的语句
-        self.effect_after_interact_svars = {}
+        self.risky_stmts_after_interaction = set() #* interaction后执行mint或者变量修改的语句集合
+        self.interaction_points = {} #* 可以被劫持、转账出去、铸造的位置
+        self.interaction_points_properties = {} #* hijacked 和 financial_risk 兩種屬性
+        self.indirect_risk_points = {} #* 间接危险点：影响直接危险点的点        
+        
+        #變量相關
+        self.effect_after_interact_svars:Dict[str, list] = {} # 每个语句修改的全局变量列表 
         self.return_stmts_vars = {}
         self.written_svars = set()
-        self.call_graph :nx.DiGraph = call_graph
-        self.cfg = None # 当前函数的CFG
-
-        self.interact_dir = None
-
-    def can_interaction(self):
+        self.all_construct_state_vars:set = None #需要初始化時由語義分析器賦值
+        self.local_storages_map_to_svar = {} #* int storage VAR = state_var storage和状态变量的指向关系
+        self.write_svars_point_to_storage = set()
+        self.write_state_vars = set()
+        self.state_vars_write_location:Dict[Variable_types, set(Node)] = {}
+    
+    def is_contain_interaction(self):
         return len(self.interaction_points) > 0
 
+    def is_risky_point(self, point_id):
+        
+        if point_id in self.interaction_points_properties and \
+            self.interaction_points_properties[point_id]["financial_risk"] == True:
+                return True
+        return False
+    
     def display_function_context(self):
 
         if 1: return
@@ -126,7 +162,7 @@ class FunctionAnalyzer:
             for idx, context_stmt in enumerate(current_statement_state.send_eth):
                 print(f"\t\t-CONTEXT_STMT[{idx}] {context_stmt}:")
                 for n in current_statement_state.send_eth[context_stmt]:
-                    print(f"\t\t\t-SEND_ETH@:[{idx}] {n.expression}:") # 具体执行操作的语句, 包含过程间分析
+                    print(f"\t\t\t-SEND_ETH@:[{idx}] {n.expression}:") #* 例如 to.transfer(amount)
         
         if "calls" in info_types:
             """
@@ -135,10 +171,10 @@ class FunctionAnalyzer:
             for idx, context_stmt in enumerate(current_statement_state.calls):
                 print(f"\t\t-CONTEXT_STMT[{idx}] {context_stmt}")
                 for call_stmt in current_statement_state.calls[context_stmt]:
-                    print("\t\t\t-CALL_STMT@", call_stmt.expression)
+                    print("\t\t\t-CALL_STMT@", call_stmt.expression, " type: ", type(call_stmt.expression))
                     for (_c, _api) in call_stmt.high_level_calls:
                         print(f"\t\t\t\t-CALL@ LIB: {_c.name} API: {_api.full_name}")
-            
+                        
         if "reads" in info_types:
             """
                 打印当前语句(current_statement)前文中所有读取的全局变量, 且包含过程间分析
@@ -176,7 +212,7 @@ class FunctionAnalyzer:
 
         if not self.display_stmt_call_info_flag: return
 
-        print(f"\nSTMT: {current_statement.expression} {current_statement.node_id}")
+        print(f"\nSTMT: {current_statement.expression} {current_statement.node_id} CALL INFORMATION:")
 
         for idx, in_call in enumerate(current_statement.internal_calls):
             print(f"\tINTERNAL_CALL [{idx}] -> {in_call.name}")
@@ -230,10 +266,45 @@ class FunctionAnalyzer:
         else:
             print(f"\tDEF VAR -> {current_statement.variable_declaration.name}  {current_statement.variable_declaration.type}")
 
+    
+    def display_interactions_informations(self, debug_flag=False):
+        
+        if debug_flag == False: return
+        
+        print(f"\n 函数 {self.full_name} 的 interaction points相关信息列表:")
+        for idx, interaction_point in enumerate(self.interaction_points):
+            print(f"\t 第 [{idx}] 个 point {self.stmt_map[interaction_point].expression} 的详细信息")
+            pinfo = self.interaction_points[interaction_point]
+            properties = self.interaction_points_properties[interaction_point]
+            
+            print("\t\t -> Access Control {}".format(self.ppt))
+            print("\t\t -> Re Modifier    {}".format(self.re_modifier))
+            print("\t\t -> 是否可被劫持:   {}".format(properties["hijacked"]))
+            if properties["hijacked"] == True:
+                sources = self.effect_after_interact_svars[interaction_point]
+                print("\t\t -> 污染源变量:     {}".format([v.name for v in sources]))
+                
+            print("\t\t -> 存在金融风险点: {}".format(properties["financial_risk"]))
+            print("\t\t -> 金融风险点类型: {}".format(properties["financial_risk_type"]))
+            
+            if pinfo["data_dependeds"] == None: pass
+            else: print("\t\t -> 数据依赖变量为: {}".format([v.name for v in pinfo["data_dependeds"]]))
+            
+            if pinfo["control_dependeds"] == None: pass
+            else: print("\t\t -> 控制依赖变量为: {}".format([v.name for v in pinfo["control_dependeds"]]))
+            
+            if pinfo["balance_dependeds"] == None: pass
+            else: print("\t\t -> 依赖账号余额为: {}".format([balance for balance in pinfo["balance_dependeds"]]))
+            
+            if pinfo["need_cross_contract_analysis"] == None: pass
+            else: print("\t\t -> 跨函数分析对象: {}".format([(c.name, f.name, rc.name) for (c, f, rc) in pinfo["need_cross_contract_analysis"]]))
+   
     def analyze_function_initialize(self, fpng=False):
 
+        print(f"为 {self.target_contract.name} {self.target_function.full_name} 构建函数分析器")
+        
         for stmt in self.target_function.nodes:
-            if 1: self.display_statement_var_information(stmt)
+            if 0: self.display_statement_var_information(stmt)
             self.analyze_stmt_var_info(stmt)
             self.analyze_stmt_call_info(stmt)
             self.analyze_stmt_balance_info(stmt)
@@ -244,7 +315,7 @@ class FunctionAnalyzer:
         
         self.get_graph_png(flag=fpng)
         self.init = True    
-        return True      
+        return True
     
     def analyze_stmt_balance_info(self, stmt:Node, debug_flag=True):
         """_summary_
@@ -255,27 +326,25 @@ class FunctionAnalyzer:
         """
         
         if len(self.stmts_call_infos[str(stmt.node_id)]) == 0: return
+        
         for (c, f) in self.stmts_call_infos[str(stmt.node_id)]:
             if ("token" in c.name or "Token" in c.name or "protocol" in c.name or "Protocol" in c.name) \
                and ("Balance" in f.name or "balance" in f.name):
-                   if debug_flag: print(f"\t 餘額：{stmt.expression}")
+                   if 1: print(f"\t 餘額：{stmt.expression}")
                    self.stmts_var_infos[str(stmt.node_id)]["use_balance"].add(f"balance of {c.name}")
             
             elif ("Balance" in f.name or "balance" in f.name):
-                self.rich_console.print(f"[read underline] 疑似使用balance {stmt.expression}")         
-                
+                self.rich_console.print(f"[read underline] 疑似使用balance {stmt.expression}")
+                self.stmts_var_infos[str(stmt.node_id)]["use_balance"].add(f"balance of {c.name}")         
     
     def analyze_stmt_state_var_info(self, stmt:Node, debug_flag=False):
 
         if len(stmt.state_variables_written) > 0:
             if debug_flag: print(f"STMT_EFFECT_AFTER_INTERACT: {stmt.expression}")
-
-        for var in stmt.state_variables_written:
-            if debug_flag: print(f"\tEFFECT --> name:{var.full_name}, type:{var.type}")
-            self.effect_after_interact_svars[str(stmt.node_id)] = [v for v in stmt.state_variables_written]
         
-        for (called_contract, called_function) in stmt.high_level_calls:
-            print("\tCALL --> {} {}".format(called_contract.name, called_function.name))
+        self.effect_after_interact_svars[str(stmt.node_id)] = [v for v in stmt.state_variables_written]
+        
+        return set([v for v in stmt.state_variables_written])
 
     def analyze_stmt_call_info(self, current_statement: Node):
         
@@ -317,20 +386,54 @@ class FunctionAnalyzer:
         self.stmts_var_infos[str(current_statement.node_id)] = stmt_var_info
 
         return stmt_var_info
-            
+    
+    def analyze_function_interactions(self, debug_flag=False):
+        """_summary_
+        判断当前函数是否存在interaction操作:
+        FUN1-C1
+            -> stmt_a @ FUN1-C1: call FUN2-C1
+                -> stmt_b @ FUN2-C1: call FUN3-C2
+                    -> stmt_c @ FUN3-C2: call token.transfer 
+        分析结果为：{"stmt":stmt_a, "to_c":C2, "to_f":FUN3, "action_type": RE}
         
-
-    def analyze_stmt_interaction(self, current_statement:Node):
+        Args:
+            debug_flag (bool, optional): _description_. Defaults to False.
         """
-            判斷當前語句是否可以进行interaction操作
+        for stmt in self.target_function.nodes:
+            
+            if 0: self.display_statement_context(stmt, ALL_CONTEXT_INFO)
+            if 0: self.display_statement_call_information(stmt)
+            if 0: self.display_statement_var_information(stmt)
+
+            do_interaction, c, f, action_type =  self.analyze_stmt_interaction(stmt)
+            if do_interaction:
+                
+                self.interaction_points[str(stmt.node_id)] = {
+                    "stmt":stmt, 
+                    "to_c":c,
+                    "to_f":f, 
+                    "action_type": action_type,
+                    "data_dependeds": [],
+                    "control_dependeds": [],
+                    "balance_dependeds": [],
+                    "need_cross_contract_analysis": [],
+                }
+                if debug_flag: print(f"當前语句 {stmt.expression}  存在可被劫持的interaction操作 {action_type}") 
+                
+                #* interaction对应的属性初始化
+                self.interaction_points_properties[str(stmt.node_id)] = {"hijacked":False, "financial_risk":False,"financial_risk_type":""}
+    
+    def analyze_stmt_interaction(self, current_statement:Node):
+        """ 
+            判斷當前語句是否可以包含interaction操作
             1: 可以re的interaction操作
             2: 不可以re的interaction操作
         """
         
-        for ex_call in current_statement.external_calls_as_expressions:
-            if ".call" in str(ex_call): # .call
-                return True, self.target_contract, current_statement, RE_INTERACTION
-        
+        for (called_var, called_llc) in current_statement.low_level_calls:
+            if called_llc == "call":  
+                return True, self.target_contract, current_statement.function, LLC_INTERACTION
+
         if self.context_key not in current_statement.context:
             return False, None, None, False
         
@@ -339,10 +442,28 @@ class FunctionAnalyzer:
         if current_statement not in context_of_current_statement.calls:
              return False, None, None, False
         
-        # token.transfer || token.transferFrom 只提取当前语句的上下文信息
+        #* 上下文中有直接调用 transfer 接口的
+        for idx, context_stmt in enumerate(context_of_current_statement.send_eth):
+            for send_eth_stmt in context_of_current_statement.send_eth[context_stmt]:
+                self.display_statement_call_information(send_eth_stmt)
+                if ".transfer(" in str(send_eth_stmt.expression):
+                    return True, send_eth_stmt.function.contract_declarer, send_eth_stmt.function, NORMAL_INTERACTION
+
+        #TODO 当前语句可能是一个函数调用，其内部可能包含多个interaction操作，规避
         call_stmts = context_of_current_statement.calls[current_statement] # token.transfer/transferFrom
         for call_stmt in call_stmts:
+            
+            #* 调用LOW-LEVEL CALL   e.g., FUN1 call FUN2 {add.call.valu()}
+            for (called_var, called_llc) in call_stmt.low_level_calls:
+                if called_llc == "call" \
+                    and "abi.encodeWithSignature" not in str(call_stmt.expression): #todo:规避 for 008 
+                    print(f"\t -> CALLED VAR:{called_var.name} CALLED_LLC:{called_llc} @ {call_stmt.expression}")
+                    return True, call_stmt.function.contract_declarer, call_stmt.function, LLC_INTERACTION
+            
+            #* 调用其他合约的接口
             for (called_contract, called_api) in call_stmt.high_level_calls:
+                
+                all_inherit_cnames = [c.name for c in called_contract.inheritance]
                 
                 # EIP20NonStandardInterface ERC20XXXX
                 if ("ERC20" in called_contract.name or "EIP20" in called_contract.name or "ERC777" in called_contract.name) \
@@ -356,10 +477,17 @@ class FunctionAnalyzer:
                     return True, called_contract, called_api, RE_INTERACTION
                 
                 #* ERC721 onERC721Received 钩子
-                if ("ERC721" in called_contract.name) \
-                    and called_api.full_name in ["onERC721Received(address,address,uint256,bytes)"]:
+                if ("ERC721" in all_inherit_cnames or "IERC721" in all_inherit_cnames) \
+                    and called_api.name in ["onERC721Received", "transfer", "transferFrom", "safeTransferFrom"]:
                     print(f"\t -> CALLE_API_STMT: {call_stmt.expression}")
                     print(f"\t -> ERC721 INTERACT: {called_contract.name}  {called_api.full_name}")
+                    return True, called_contract, called_api, RE_INTERACTION
+                
+                #* 非直接為ERC777, 而是繼承自繼承自ERC777
+                if( "ERC777" in all_inherit_cnames or "ERC1155" in all_inherit_cnames)\
+                    and called_api.name in ["transfer", "transferFrom", "safeTransferFrom"]:
+                    print(f"\t -> CALLE_API_STMT: {call_stmt.expression}")
+                    print(f"\t -> ERC777 INTERACT: {called_contract.name}  {called_api.full_name}")
                     return True, called_contract, called_api, RE_INTERACTION
                 
                 #* TOKEN MINT 操作
@@ -373,267 +501,231 @@ class FunctionAnalyzer:
                 if ("mint" in called_api.full_name): 
                     self.rich_console.print(f"[bold red] {called_contract.name}  {called_api.full_name}")
                 
-                
+                #* openzeppelin的Address庫
+                if "Address" == called_contract.name and called_api.name == "sendValue":
+                    print(f"\t -> CALLE_openzeppelin: {call_stmt.expression}")
+                    print(f"\t -> openzeppelin lib: {called_contract.name}  API:{called_api.full_name}")
+                    return True, called_contract, called_api, LLC_INTERACTION
+                    
                 print(f"\t -> UNKNOWN TOKEN_API INTERACT: {called_contract.name}  {called_api.full_name}")
                 if "withdraw" in called_api.full_name:
                     return True, called_contract, called_api, NORMAL_INTERACTION
 
         return False, None, None, False
     
-    
-    def analyze_stmt_interaction_direction(self, current_stmt:Node, call_stmt:Node, called_api:SFunction):
+    def analyze_effect_after_interaction_point(self, interaction_point:Node):
         """
-            判断interaction的financial risk情况, 转账出去的存在financial risk。
-
-            err = doTransferOut(asset, msg.sender, localResults.withdrawAmount); # current_stmt
-            --> mix_test(token, to, amount);  # 中間
-                --> token.transfer(to,amount); # real call_stmt
+        对于指定的interaction point, 得到：
+        1. 之后修改的全局变量
+        2. 修改全局变量的语句
         """
-
-        # 第一个入参就是交易对象
-        if called_api.full_name == "transfer(address,uint256)":
-            transfer_oject_name = str(call_stmt.expression).split("transfer(")[1].split(",")[0]
-            for var in call_stmt.variables_read:
-                if var.name  == transfer_oject_name:
-                    print(f"交易对象：{var.name} {str(var.type)}")
-                    depended_vars = data_dependency.get_dependencies(var, self.target_contract)
-                    for depend_var in depended_vars:
-                        print(f"\t -> 依賴對象 {depend_var.name} {str(depend_var.type)}")
-                        if depend_var.name == "msg.sender":
-                            self.interaction_out_stmts[current_stmt] = 1 # 当前语句转账出去，代表有金融风险
-                        
-
-    
-
-    def analyze_effect_after_interaction_intraprocedural_analysis(self, debug_flag=False):
-
-        """
-            NOTE: 得到interaction之后的全局变量分析, 且只进行过程内分析
-        """
+        state_vars = set()
+        stmts_after_interaction = {}
         
-        stmts_need_interprocedural_analyze = set()
-
-        for stmt_id in self.stmts_after_interaction:
-
+        #* 寻找interact之后执行的语句，包含当前的interaction_point
+        paths = nx.all_simple_paths(self.cfg, str(interaction_point.node_id), "EXIT_POINT")
+        for path in paths:
+            for stmt_id in path:
+                if stmt_id not in stmts_after_interaction and stmt_id != "EXIT_POINT":
+                    stmts_after_interaction[stmt_id] = 1
+        
+        #* 寻找修改的变量
+        for stmt_id in stmts_after_interaction:
             stmt_info:Node = self.stmt_map[stmt_id]
-            self.effect_after_interact_svars[str(stmt_info.node_id)] = [v for v in stmt_info.state_variables_written]
-            if debug_flag: print("\t interact之後语句:{} 修改的全局變量: {}".format(stmt_info.expression, [v.name for v in stmt_info.state_variables_written]))
-
-           
-            for (called_contract, called_function) in stmt_info.high_level_calls: 
-                # if "mint" not in called_function.name: continue #? 此處只根據名單進行過程見分析
-                if debug_flag: print(f"\t HIGH_CALL 需要過程閒分析: -> {called_function.name} - {called_contract.name}")
-                stmts_need_interprocedural_analyze.add((called_contract, called_function))
-                
-            for called_function in stmt_info.internal_calls:
-                if debug_flag: print(f"\t IN_CALL需要過程閒分析: -> {self.target_contract.name} - {called_function.name}")
-                stmts_need_interprocedural_analyze.add((self.target_contract, called_function))
-
-        return len(self.effect_after_interact_svars) > 0, list(stmts_need_interprocedural_analyze)
-
-
-    def analyze_effect_after_interaction(self):
-        """
-        TODO: 假设当前一个函数内部只有一个interaction语句
-        """
-        for interaction_stmt_id in self.interaction_points:
+            if len(stmt_info.state_variables_written) > 0:
+                self.risky_stmts_after_interaction.add(stmt_info)
+                for v in stmt_info.state_variables_written: state_vars.add(v)
             
-            #* 如果此处interaction是不能re的interaction，不需要分析effect after interact vars
-            if self.interaction_points[interaction_stmt_id]["action_type"] != RE_INTERACTION: continue
-
-            #* 寻找interact之后执行的语句
-            paths = nx.all_simple_paths(self.cfg, str(interaction_stmt_id), "EXIT_POINT")
-            stmts_after_interaction = {} # 所有interaction之后执行的语句
-            for path in paths:
-                for stmt_id in path:
-                    if stmt_id not in stmts_after_interaction and stmt_id != "EXIT_POINT":
-                        stmts_after_interaction[stmt_id] = 1
-            
-            #* 寻找修改的变量
-            for stmt_id in stmts_after_interaction:
-                stmt_info:Node = self.stmt_map[stmt_id]
-                self.analyze_stmt_state_var_info(stmt_info)
-
-        return len(self.effect_after_interact_svars) > 0
-            
-    def analyze_function_with_interaction(self, debug_flag=False):
-        """
-            利用每个语句的context信息判断当前语句是否进行interaction操作
-            语句的context信息已经包含了过程间分析了
-        """
-        for stmt in self.target_function.nodes:
-            
-            if 0: self.display_statement_context(stmt, ALL_CONTEXT_INFO)
-            if 0: self.display_statement_call_information(stmt)
-            if 0: self.display_statement_var_information(stmt)
-
-            do_interaction, c, f, action_type =  self.analyze_stmt_interaction(stmt)
-            if do_interaction:
-                self.interaction_points[str(stmt.node_id)] = {"stmt":stmt, "to_c":c, "to_f":f, "action_type": action_type}
-                if debug_flag: print(f"當前语句 {stmt.expression}  存在可被劫持的interaction操作 {action_type}")       
-    
-    #! 临时方案
-    def analyze_interaction_financial_risky(self):
-        """
-            可以被攻击者利用的操作类型
-            1. 转账出去的操作
-            2. mint操作
-        """
-
-        out_keys = ["withdraw", "borrow"]
-        for out_key in out_keys:
-            if out_key in self.target_function.name:
-                self.interact_dir = "out"
-                return "out"
+            if  stmt_id in self.interaction_points and self.interaction_points[stmt_id]["action_type"] == MINT_INTERACTION:
+                self.risky_stmts_after_interaction.add(stmt_info)
         
-        for interaction_point in self.interaction_points:
-            if self.interaction_points[interaction_point]["action_type"] == MINT_INTERACTION:
-                return "mint"
+        return state_vars, self.risky_stmts_after_interaction
+    
+    def analyze_interaction_properties(self, interaction_point):
+        
+        #* 1:判断当前的interaction_point是否能够被攻击者劫持控制流
+        interaction_type = self.interaction_points[interaction_point]["action_type"]
+        if interaction_type in HIJACKED_INTERACTIONS:
+            self.interaction_points_properties[interaction_point]["hijacked"] = True
+        else: 
+            self.interaction_points_properties[interaction_point]["hijacked"] = False
+        
+        #* 2:判断当前的interaction_point是否存在重入金融风险
+        financial_risk_keys = ["sendValue", "withdraw", "borrow", "doTransferOut", "mint", "_safeMint", "safeMint"]
+        no_financial_risk_keys = ["deposit", "doTransferIn"]
+        
+        if interaction_type == MINT_INTERACTION: 
+            self.interaction_points_properties[interaction_point]["financial_risk"] = True
+            self.interaction_points_properties[interaction_point]["financial_risk_type"]  = "mint"
+        else:
+            
+            stmt:Node = self.interaction_points[interaction_point]["stmt"]
+            if "msg.sender.call" in str(stmt.expression): #* 直接调用交易发起方
+                    self.interaction_points_properties[interaction_point]["financial_risk"] = True
+                    self.interaction_points_properties[interaction_point]["financial_risk_type"] = "out"
+                    return  self.interaction_points_properties[interaction_point]["hijacked"], \
+                            self.interaction_points_properties[interaction_point]["financial_risk"] ,\
+                            self.interaction_points_properties[interaction_point]["financial_risk_type"]  
+            
+            call_stack = self.interaction_points[interaction_point]["call_stack"]
+            for (_, fname) in call_stack:
+                
+                if fname in financial_risk_keys: 
+                    self.interaction_points_properties[interaction_point]["financial_risk"] = True
+                    self.interaction_points_properties[interaction_point]["financial_risk_type"] = "out"
+                    break
+                
+                if fname in no_financial_risk_keys:
+                    self.interaction_points_properties[interaction_point]["financial_risk"] = False
+                    self.interaction_points_properties[interaction_point]["financial_risk_type"] = "no"
+                    break
+        
+        return  self.interaction_points_properties[interaction_point]["hijacked"], \
+            self.interaction_points_properties[interaction_point]["financial_risk"] ,\
+            self.interaction_points_properties[interaction_point]["financial_risk_type"]    
+    
+    def analyze_access_control_protection(self, end_point:Node):
+        """
+        entry_point ---> end_point
+            判断执行路径上有没有path protection technology:
+            1. Access Control Before Payment
+            2. Protection by Modifiers
+        Args:
+            end_point (Node): 分析的结束节点
+        """
+        ac_flag = False
+        modifier_cnt = len([m.name for m in self.target_function.modifiers if "nonReentrant" in m.name])
+        
+        for modifier in self.target_function.modifiers:
+            
+            if "onlyOwner" in modifier.name:
+                ac_flag = True
+                ppt = "Protected by onlyOwner"
+                print("{} - INFO:{}".format(modifier.name, ppt))
+                return modifier_cnt, ac_flag, ppt, modifier
 
-        self.interact_dir = "in"
-        return "in"
+            if 0 and str(modifier.name).startswith("only"): #! 造成漏報
+                ac_flag = True
+                ppt = "Protected by only-type modifier"
+                print("{} - INFO:{}".format(modifier.name, ppt))
+                return modifier_cnt, ac_flag, ppt, modifier
+
+        paths = nx.all_simple_paths(self.cfg, "0", str(end_point.node_id))
+        for path in paths:
+            for stmt_id in path:
+                stmt_info:Node = self.cfg.nodes[stmt_id]["node"]
+                
+                if stmt_info.is_conditional(include_loop=False):
+                    current_read_vars = set([v for v in stmt_info.variables_read])
+                    #* require(msg.sender == CONST_vAR)
+                    if "msg.sender" in [v.name for v in current_read_vars]:
+                        for v in current_read_vars:
+                            if v in self.all_construct_state_vars:
+                                ac_flag = True
+                                ppt = "Protected by Constructed Vars"
+                                print("{} - INFO:{}".format(stmt_info.expression, ppt))
+                                return modifier_cnt, ac_flag, ppt, stmt_info
+
+                    #TODO: 条件较粗
+                    if "msg.sender ==" in str(stmt_info.expression) \
+                        or "== msg.sender" in str(stmt_info.expression):
+                        ac_flag = True
+                        ppt = "Protected by msg.sender check" 
+                        print("{} - INFO:{}".format(stmt_info.expression, ppt))
+                        return modifier_cnt, ac_flag, ppt, stmt_info
+
+                    #TODO: modifier保护
+                    
+        return modifier_cnt, ac_flag, "No Path Protected", None
+    
+    def analyze_return_point_for_auxiliary(self, svars):
+        
+        self.interaction_points["return"] = {
+            "action_type": "return",
+            "data_dependeds": svars,
+            "control_dependeds": [],
+            "balance_dependeds": [],
+            "need_cross_contract_analysis":[]
+        }
+        self.interaction_points_properties["return"] = {
+            "hijacked": False,
+            "financial_risk": True,
+            "financial_risk_type": "cross_contract_return"
+        }
+        
+    def get_financial_risk_svars(self):
+        """
+        分析对于给定的financial risk函数, 分析每个financial risk interaction point
+            -> 针对每个point, 得到该point依赖的状态变量
+                -> 分析能够修改这些变量的函数作为间接的函数入口
+        
+        Args:
+            target_func (SFunction): _description_
+            target_analyzer (FunctionAnalyzer): _description_
+        """
+        risk_svars = set()
+        for point in self.interaction_points_properties:
+            
+            is_risk = self.is_risky_point(point)
+            if is_risk == False: continue
+            
+            risk_svars = risk_svars.union(self.interaction_points[point]["data_dependeds"])
+            risk_svars = risk_svars.union(self.interaction_points[point]["control_dependeds"])
+        
+        return risk_svars
     
     def get_all_return_variable_stmts(self):
         """
             当前函数所有 return语句和其return的返回值
         """
-        print(f"分析函數 {self.target_function.name} 的返回值：")
+        print(f"分析函數 {self.target_function.name} {self.target_function.is_implemented} {self.target_function.id} 的返回值：")
         for stmt in self.target_function.nodes:
             if stmt.will_return is True:
-                print("\t -> EXP: {} read: {}".format(stmt.expression, [v.name for v in stmt.variables_read]))
+                print(f"\t -> EXP: {stmt.expression}")
+                print(f"\t -> EXP: {len(stmt.variables_read)}")
+                # print("\t -> EXP: {} read: {}".format(stmt.expression, [v.name for v in stmt.variables_read]))
                 self.return_stmts_vars[str(stmt.node_id)] = {"vars": [v for v in stmt.variables_read]}
                 
         return self.return_stmts_vars
     
-    def get_all_stmts_after_interaction(self):
+    def get_function_properties(self):
         """
-            得到interaction之后能够执行的语句
+        综合函数内部所有的interaction point的属性
+        得到function-level的属性
         """
-        for interaction_stmt_id in self.interaction_points:
-
-            #* 如果此处interaction是不能re的interaction，不需要分析effect after interact vars
-            if self.interaction_points[interaction_stmt_id]["action_type"] != RE_INTERACTION: continue
-
-            #* 寻找interact之后执行的语句: 1.修改全局变量；2.mint
-            paths = nx.all_simple_paths(self.cfg, str(interaction_stmt_id), "EXIT_POINT")
-            for path in paths:
-                for stmt_id in path:
-                    
-                    if stmt_id not in self.stmts_after_interaction and stmt_id != "EXIT_POINT":
-                        self.stmts_after_interaction[stmt_id] = 1
-
-                    if stmt_id in self.interaction_points and self.interaction_points[stmt_id]["action_type"] == MINT_INTERACTION:
-                        self.stmts_after_interaction[stmt_id] = 1
-                        
-        return self.stmts_after_interaction
-    
-    def get_all_written_state_variabels(self):
         
-        for stmt in self.target_function.nodes:
-            write_svars = [v for v in stmt.state_variables_written]
-            self.written_svars = self.written_svars.union(write_svars)
-
-        return self.written_svars
-
-    def get_interaction_call_chain(self):
-
-        for interaction_point in self.interaction_point_call_chains:
-            call_chains = self.interaction_point_call_chains[interaction_point]
-            return call_chains
-
-    
-    def get_call_stmt_location(self, call_pair, entry_stmt:Node):
-
-        call_relations = []
-        for idx, (callee_function_id, called_function_id) in enumerate(call_pair):
-            
-            # 调用者信息
-            callee_function :SFunction = self.call_graph.nodes[callee_function_id]["f"]
-            callee_contract :SContract = self.call_graph.nodes[callee_function_id]["c"]
-
-            # 被调用者信息
-            called_function :SFunction = self.call_graph.nodes[called_function_id]["f"]
-            called_contract :SContract = self.call_graph.nodes[called_function_id]["c"]
-            
-            call_relation = {
-                "callee_function": callee_function,
-                "callee_contract": callee_contract,
-                "at_stmt": None,
-                "called_function": called_function,
-                "called_contract": called_contract,
-                "description": None
-            }
-
-            description = f"\n{callee_function.name}-{callee_contract.name} CALL: {called_function.name}-{called_contract.name}"
-            print(description)
-
-            if idx == 0:
-                description += f" @ {entry_stmt.expression}"
-                call_relation["at_stmt"] = entry_stmt
-                call_relation["description"] = description
-                call_relations.append(call_relation)
-
-                print(f"\t-> @ STMT :{entry_stmt.expression}")
-
-            else: # locate the stmt in callee_function for calling called function
-                found_flag = False
-                for stmt in callee_function.nodes:
-
-                    if 0: self.display_statement_call_information(stmt) # 調試
-
-                    if found_flag == True: break # 避免重複尋找
-                    for in_called_function in stmt.internal_calls:
-                        if  in_called_function.id == called_function.id \
-                            and in_called_function.contract_declarer.id == called_contract.id:
-
-                            description += f" @ {stmt.expression}"
-                            call_relation["at_stmt"] = stmt
-                            call_relation["description"] = description
-                            call_relations.append(call_relation)
-
-                            print(f"\t-> @ STMT :{stmt.expression}")
-                            found_flag = True
-                            break
-                    
-                    if found_flag == True: break # 避免重複尋找
-                    for (high_called_contract, high_called_fun_or_var)  in stmt.high_level_calls:
-                        if  high_called_fun_or_var.id == called_function.id \
-                            and high_called_contract.id == called_contract.id:
-
-                            description += f" @ {stmt.expression}"
-                            call_relation["at_stmt"] = stmt
-                            call_relation["description"] = description
-                            call_relations.append(call_relation)
-
-                            print(f"\t-> @ STMT :{stmt.expression}")
-                            found_flag = True
-                            break
+        hijacked = False
+        financial_risk = False
+        financial_risk_type = ""
+        for _properties in self.interaction_points_properties.values():
+            hijacked |= _properties["hijacked"]
+            financial_risk |= _properties["financial_risk"]
+            financial_risk_type += _properties["financial_risk_type"] + "  "
         
-        return call_relations
+        self.hijacked = hijacked
+        self.financial_risk = financial_risk
+        self.financial_risk_type = financial_risk_type
+        
+        return self.ppt, hijacked, financial_risk, financial_risk_type
+    
 
-    def get_call_stack(self):
-        """
-            get the call chain from entry_function --> low-level interaction stmt
-        """
-
-        for interact_stmt_id in self.interaction_points:
-
-            stmt :Node = self.interaction_points[interact_stmt_id]["stmt"]
-            c :SContract = self.interaction_points[interact_stmt_id]["to_c"]
-            f :SFunction = self.interaction_points[interact_stmt_id]["to_f"]
+    def get_called_function_stmt(self, called_functoin:SFunction):
+        
+        stmt_function_calling:Node = None
+        for stmt in self.target_function.nodes: 
+            for in_called_function in stmt.internal_calls:
+                if in_called_function.full_name == called_functoin.full_name:
+                    stmt_function_calling = stmt
+                    break
             
-            paths = nx.all_simple_paths(self.call_graph, str(stmt.function.id), str(f.id))
-            for path in paths: # TODO:此处假设只有一条PATH
-                
-                call_stack = [(node_id, self.call_graph.nodes[node_id]['f'].name)  for node_id in path]
-                if len(call_stack) == 1: continue # 調用棧長度小於2
-
-                call_pair = [(call_stack[id-1][0], call_stack[id][0]) for id in range(1, len(call_stack))]
-                print("\n開始解析調用棧: ", [(call_stack[id-1][1], call_stack[id][1]) for id in range(1, len(call_stack))])
-                self.interaction_point_call_chains[interact_stmt_id]  = self.get_call_stmt_location(call_pair, stmt)
-
-                return call_stack
-
+            if stmt_function_calling != None: break
+            for (_, high_called_fun_or_var)  in stmt.high_level_calls:  
+                if high_called_fun_or_var.full_name == called_functoin.full_name:
+                    stmt_function_calling = stmt
+                    break
+        
+        return stmt_function_calling
+     
     def get_function_cfg(self):
 
         cfg_dot_file = "{}//{}_cfg.dot".format(self.target_log_dir, self.target_function.name)
@@ -655,28 +747,71 @@ class FunctionAnalyzer:
             
             cfg.nodes[cfg_node_id]["node"] = self.stmt_map[str(cfg_node_id)]
             
-        cfg.add_node("EXIT_POINT", label="EXIT_POINT")
+        cfg.add_node("EXIT_POINT", label="EXIT_POINT", node="EXIT_POINT")
         for leaf_node in leaf_nodes:
             cfg.add_edge(leaf_node, "EXIT_POINT")
         
         self.cfg = cfg
+        os.remove(cfg_dot_file)
         return True
 
-        # os.remove(cfg_dot_file)
-
     def get_graph_png(self, flag=False):
-
+        
         if not flag: return
-
+        
+        tmp_cfg = nx.DiGraph(self.cfg)
+        for node_id in tmp_cfg.nodes: tmp_cfg.nodes[node_id].pop("node")
+        
         cfg_dot_file = "{}//{}_cfg.dot".format(self.target_log_dir, self.target_function.name)
         cfg_png_file = "{}//{}_cfg.png".format(self.target_log_dir, self.target_function.name)
 
-        nx_dot.write_dot(self.cfg, cfg_dot_file)
+        nx_dot.write_dot(tmp_cfg, cfg_dot_file)
         subprocess.check_call(["dot", "-Tpng", cfg_dot_file, "-o", cfg_png_file])
        
 
-    
+    def get_all_written_storage_vars(self):
+        """
+        storage var 分爲2種
+        1. state var
+        2. storage var
+        """
+        for write_state_var in self.target_function.state_variables_written:
+            self.write_state_vars.add(write_state_var)
+
+        for stmt in self.target_function.nodes:
             
+            for svar_write in stmt.state_variables_written:
+                if svar_write not in self.state_vars_write_location:
+                    self.state_vars_write_location[svar_write] = set()
+                self.state_vars_write_location[svar_write].add(stmt)
+
+            delete_op = [ir for ir in  stmt.all_slithir_operations() if isinstance(ir, Delete)]
+            write_local_storage_list = [w_v for w_v in stmt.local_variables_written if w_v.is_storage == True]
+            read_state_vars = set([v for v in stmt.state_variables_read])
+            if 0: print(f"STORAGE_VAR补全 {stmt.expression}: {len(delete_op), len(write_local_storage_list), len(read_state_vars)}")   
+            
+            #*  Market storage marketToExit (write storage) = markets[address(cToken)] (read state_var); 定義storage
+            #* local_storage: marketToExit --> State_Var:markets 的指向关系需要保存
+            if len(read_state_vars) != 0 and len(write_local_storage_list) > 0:
+                for write_local_storage in write_local_storage_list:
+                    self.local_storages_map_to_svar[write_local_storage] = read_state_vars
+
+            #* delete marketToExit.accountMembership[msg.sender];
+            #* marketToExit.accountMembership[msg.sender] = 0
+            elif len(write_local_storage_list) > 0:
+                for write_local_storage in write_local_storage_list:
+                    
+                    #* 修改被定义过的storage变量 =等价于=> 修改其对应的state_var
+                    if write_local_storage in self.local_storages_map_to_svar:
+                        for state_var in self.local_storages_map_to_svar[write_local_storage]:
+                            self.write_svars_point_to_storage.add(state_var)
+                            self.write_state_vars.add(state_var)
+                            
+                            if state_var not in self.state_vars_write_location:
+                                self.state_vars_write_location[state_var] = set()
+                            self.state_vars_write_location[state_var].add(stmt)     
+                                   
+        print(f"當前函數：{self.name} 修改的狀態為{[v.name for v in self.write_state_vars]}")
 
 
 
